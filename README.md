@@ -20,3 +20,60 @@ N=3이면 W=2 정도로 설정해서 과반수 응답만 받으면 클라이언�
 
 * R+W > N 공식을 만족시키면 읽기 쿼럼과 쓰기 쿼럼이 항상 겹치기 때문에, 전체 노드를 기다리지 않아도 최신 데이터를 읽을 수 있다는 정합성 보장이 됨
 ```
+
+---
+
+### 2. 프로젝트 구조
+
+```
+quorum_store/              # 핵심 로직 (단일 프로세스 asyncio 시뮬레이션)
+  models.py                 # WriteAck, WriteResult, ReadReply, ReadResult 등 공용 모델
+  node.py                    # DataNode - 노드 하나(저장 + 지연/장애 시뮬레이션)
+  coordinator.py              # RoutingCoordinator - 쓰기/읽기 쿼럼, read repair,
+                              #  hinted handoff, 헬스 모니터
+
+quorum_write_routing.py     # 1단계: 쓰기 쿼럼만 다루는 최초 버전 (W=1 / N / 쿼럼 비교 데모)
+demo_read_write.py          # 2단계: 읽기 쿼럼 + read repair 데모
+demo_retry_and_health.py    # 2단계: 노드 장애 -> hinted handoff 재시도 + 헬스 모니터 데모
+
+network/                    # 3단계: 진짜 HTTP 서버로 옮긴 버전
+  node_server.py             # 노드 하나 = FastAPI 서버 하나
+  coordinator_server.py       # 코디네이터도 FastAPI 서버, httpx로 노드에 실제 요청
+  client_demo.py              # 코디네이터 서버에 실제로 쓰기/읽기 요청 날리는 예시
+```
+
+### 3. 구현한 것
+
+- **쓰기 쿼럼**: 주 노드 저장 → 부 노드 병렬 복제 → W개 ack 오면 응답, 나머지는 백그라운드 복제
+- **읽기 쿼럼**: N개 중 R개 응답을 모아 가장 높은 버전(version)을 정답으로 채택 (Last-Write-Wins)
+- **read repair**: 읽는 도중 뒤처진(낮은 버전/누락) 노드를 발견하면 백그라운드로 최신 값 갱신
+- **hinted handoff**: 복제 실패한 쓰기를 큐에 쌓아뒀다가 별도 워커가 backoff 하며 재시도
+- **헬스 모니터**: 주기적으로 ping 보내서 죽은 노드를 감지하고, 살아있는 노드로만 쿼럼 계산
+
+### 4. 실행 방법
+
+**시뮬레이션 버전** (네트워크 없이 한 프로세스 안에서 동작, 로직 이해용)
+```bash
+python3 quorum_write_routing.py       # 쓰기만: W=1 vs 쿼럼 vs 전체 ack 응답시간 비교
+python3 demo_read_write.py            # 읽기 쿼럼 + read repair
+python3 demo_retry_and_health.py      # 노드 장애 + hinted handoff + 헬스 모니터
+```
+
+**실제 네트워크 버전** (노드/코디네이터가 진짜 프로세스로 분리됨)
+```bash
+pip install -r requirements.txt
+
+# 터미널 4개 (또는 백그라운드)에 각각
+NODE_ID=primary     uvicorn network.node_server:app --port 8001
+NODE_ID=secondary-1 uvicorn network.node_server:app --port 8002
+NODE_ID=secondary-2 uvicorn network.node_server:app --port 8003
+NODE_URLS=http://localhost:8001,http://localhost:8002,http://localhost:8003 \
+    uvicorn network.coordinator_server:app --port 9000
+
+# 그리고 나서
+python3 network/client_demo.py
+```
+
+> network 버전은 핵심 쿼럼 라우팅(쓰기/읽기)만 옮긴 버전이라, read repair/hinted
+> handoff/헬스 모니터는 아직 시뮬레이션(`quorum_store` 패키지) 쪽에만 있음. 다음에
+> 이어서 옮길 예정.
